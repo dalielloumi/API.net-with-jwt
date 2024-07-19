@@ -1,32 +1,33 @@
-﻿using Microsoft.AspNetCore.Identity;
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 using Microsoft.IdentityModel.Tokens;
 using PFA.Models;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
-using Microsoft.AspNetCore.Authorization;
 
 namespace PFA.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    public class AccountController : Controller
+    public class AccountController : ControllerBase
     {
-        private readonly UserManager<IdentityUser> userManager;
-        private readonly SignInManager<IdentityUser> signInManager;
-        private readonly IConfiguration configuration;
+        private readonly UserManager<IdentityUser> _userManager;
+        private readonly SignInManager<IdentityUser> _signInManager;
+        private readonly IConfiguration _configuration;
+        private readonly ILogger<AccountController> _logger;
 
-        public AccountController(UserManager<IdentityUser> userManager, SignInManager<IdentityUser> signInManager, IConfiguration configuration)
+        public AccountController(UserManager<IdentityUser> userManager, SignInManager<IdentityUser> signInManager, IConfiguration configuration, ILogger<AccountController> logger)
         {
-            this.userManager = userManager;
-            this.signInManager = signInManager;
-            this.configuration = configuration;
+            _userManager = userManager;
+            _signInManager = signInManager;
+            _configuration = configuration;
+            _logger = logger;
         }
 
-        [HttpPost]
-        [ValidateAntiForgeryToken]
-        [Authorize]
+        [HttpPost("Register")]
         public async Task<IActionResult> RegisterNewUser(RegisterModel newUserVM)
         {
             if (ModelState.IsValid)
@@ -34,57 +35,76 @@ namespace PFA.Controllers
                 IdentityUser appUser = new IdentityUser
                 {
                     UserName = newUserVM.Email,
-                    Email = newUserVM.Email
+                    Email = newUserVM.Email,
+                    PhoneNumber = newUserVM.phoneNumber
                 };
-                IdentityResult result = await userManager.CreateAsync(appUser, newUserVM.Password);
+                IdentityResult result = await _userManager.CreateAsync(appUser, newUserVM.Password);
                 if (result.Succeeded)
                 {
                     return Ok("success");
                 }
                 else
                 {
-                    ModelState.AddModelError("Erreur", "Problème de création d'utilisateur");
+                    foreach (var error in result.Errors)
+                    {
+                        ModelState.AddModelError("Erreur", error.Description);
+                        _logger.LogError("User creation error: {Error}", error.Description);
+                    }
                 }
+            }
+            else
+            {
+                _logger.LogError("Model state is invalid: {ModelState}", ModelState);
             }
             return BadRequest(ModelState);
         }
-
-        [HttpPost("login")]
-        public async Task<IActionResult> Login(LoginVM loginVM)
+        [HttpPost("Login")]
+        public async Task<IActionResult> Login(LoginVM model)
         {
             if (ModelState.IsValid)
             {
-                IdentityUser user = await userManager.FindByNameAsync(loginVM.username);
+                IdentityUser user = await _userManager.FindByNameAsync(model.username);
                 if (user != null)
                 {
-                    if (await userManager.CheckPasswordAsync(user, loginVM.Password))
+                    if (await _userManager.CheckPasswordAsync(user, model.Password))
                     {
-                        var claims = new List<Claim>();
-                        claims.Add(new Claim(ClaimTypes.Name, user.UserName));
-                        claims.Add(new Claim(ClaimTypes.NameIdentifier, user.Id));
-                        claims.Add(new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()));
-                        var roles = await userManager.GetRolesAsync(user);
+                        var claims = new List<Claim>
+                {
+                    new Claim(ClaimTypes.Name, user.UserName),
+                    new Claim(ClaimTypes.NameIdentifier, user.Id),
+                    new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+                };
+                        var roles = await _userManager.GetRolesAsync(user);
                         foreach (var role in roles)
                         {
-                            claims.Add(new Claim(ClaimTypes.Role, role.ToString()));
+                            claims.Add(new Claim(ClaimTypes.Role, role));
                         }
-                        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(configuration["JWT:SecretKey"]));
-                        var sc = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+                        var secretKey = _configuration["JWT:SecretKey"];
+                        if (string.IsNullOrEmpty(secretKey))
+                        {
+                            _logger.LogError("JWT Secret Key is missing in configuration.");
+                            return StatusCode(StatusCodes.Status500InternalServerError, "Internal server error. Please check the server logs.");
+                        }
+
+                        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey));
+                        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
                         var token = new JwtSecurityToken(
+                            issuer: _configuration["JWT:Issuer"],
+                            audience: _configuration["JWT:Audience"],
                             claims: claims,
-                            issuer: configuration["JWT:Issuer"],
-                            audience: configuration["JWT:Audience"],
                             expires: DateTime.Now.AddHours(1),
-                            signingCredentials: sc
+                            signingCredentials: creds
                         );
-                        var _token = new
+
+                        var response = new
                         {
                             token = new JwtSecurityTokenHandler().WriteToken(token),
                             expiration = token.ValidTo,
-                            username = loginVM.username,
-                            role = roles
+                            username = model.username,
+                            roles
                         };
-                        return Ok(_token);
+                        return Ok(response);
                     }
                     else
                     {
@@ -96,5 +116,6 @@ namespace PFA.Controllers
             }
             return BadRequest(ModelState);
         }
+
     }
 }
